@@ -1,4 +1,8 @@
-return 200;
+export default {
+  async fetch(request, env, ctx) {
+    return new Response('OK');
+  }
+};
 
 // // --------------------------------------------------
 // // WORKER: WARCRAFT LOGS PROXY
