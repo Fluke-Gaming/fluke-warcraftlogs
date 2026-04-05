@@ -2,9 +2,6 @@ name = "warcraft-logs"
 main = "src/index.js"
 compatibility_date = "2026-02-18"
 
-[vars]
-CALENDAR_ID = "flukegaming57@gmail.com"
-
 [observability]
 [observability.logs]
 enabled = true
