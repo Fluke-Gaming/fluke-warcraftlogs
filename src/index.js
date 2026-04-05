@@ -9,7 +9,6 @@ let tokenExpiry = 0;
 
 async function getAccessToken(clientId, clientSecret) {
   if (cachedToken && Date.now() < tokenExpiry) return cachedToken;
-
   const res = await fetch("https://www.warcraftlogs.com/oauth/token", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -21,16 +20,28 @@ async function getAccessToken(clientId, clientSecret) {
   });
   if (!res.ok) throw new Error(`WCL token error: ${res.statusText}`);
   const data = await res.json();
-
   cachedToken = data.access_token;
-  tokenExpiry = Date.now() + (data.expires_in - 60) * 1000; // expire 60s early to be safe
-
+  tokenExpiry = Date.now() + (data.expires_in - 60) * 1000;
   return cachedToken;
+}
+
+async function queryWCL(query, accessToken) {
+  const res = await fetch("https://www.warcraftlogs.com/api/v2/client", {
+    method: "POST",
+    headers: {
+      "Content-Type":  "application/json",
+      "Authorization": `Bearer ${accessToken}`,
+    },
+    body: JSON.stringify({ query }),
+  });
+  if (!res.ok) throw new Error(`WCL GraphQL error: ${res.statusText}`);
+  const data = await res.json();
+  if (data.errors) throw new Error(data.errors[0].message);
+  return data;
 }
 
 export default {
   async fetch(request, env) {
-    // Allowed origins for CORS
     const ALLOWED_ORIGINS = [
       "https://flukegaming.com",
       "https://test.flukegaming.com"
@@ -42,20 +53,18 @@ export default {
       "Access-Control-Allow-Headers": "Content-Type",
       "Content-Type": "application/json",
     };
-
     if (ALLOWED_ORIGINS.includes(origin)) {
       corsHeaders["Access-Control-Allow-Origin"] = origin;
     }
-
-    // Handle preflight OPTIONS requests
     if (request.method === "OPTIONS") {
       return new Response(null, { headers: corsHeaders });
     }
 
+    // Route based on path
+    const path = new URL(request.url).pathname;
+
     const cache = caches.default;
     const cacheKey = new Request(request.url, request);
-
-    // Serve from cache if available
     let response = await cache.match(cacheKey);
     if (response) return response;
 
@@ -64,68 +73,126 @@ export default {
       const clientSecret = env.WCL_CLIENT_SECRET;
       if (!clientId || !clientSecret) throw new Error("WCL credentials not found");
 
-      // Step 1: fetch OAuth token
-      const access_token = await getAccessToken(clientId, clientSecret);
+      const accessToken = await getAccessToken(clientId, clientSecret);
+      let result;
 
-      // Step 2: query GraphQL
-      const query = `
-        query {
-          guildData {
-            guild(name: "Fluke", serverSlug: "frostmane", serverRegion: "US") {
-              zoneRanking {
-                progress {
-                  worldRank { number color }
-                  regionRank { number color }
-                  serverRank { number color }
-                }
-                speed {
-                  worldRank { number color }
-                  regionRank { number color }
-                  serverRank { number color }
+      if (path === "/rankings") {
+        const data = await queryWCL(`
+          query {
+            guildData {
+              guild(name: "Fluke", serverSlug: "frostmane", serverRegion: "US") {
+                zoneRanking {
+                  progress {
+                    worldRank { number color }
+                    regionRank { number color }
+                    serverRank { number color }
+                  }
+                  speed: {
+                    world:  zoneRankings.speed?.worldRank  ?? null,
+                    region: zoneRankings.speed?.regionRank ?? null,
+                    server: zoneRankings.speed?.serverRank ?? null,
+                  },
                 }
               }
             }
           }
+        `, accessToken);
+
+        const zoneRanking = data.data?.guildData?.guild?.zoneRanking ?? {};
+        result = {
+          progress: {
+            world:  zoneRanking.progress?.worldRank  ?? null,
+            region: zoneRanking.progress?.regionRank ?? null,
+            server: zoneRanking.progress?.serverRank ?? null,
+          },
+          speed: {
+            world:  zoneRanking.speed?.worldRank  ?? null,
+            server: zoneRanking.speed?.serverRank ?? null,
+          },
+        };
+
+      } else if (path === "/lastraid") {
+        const data = await queryWCL(`
+          query {
+            reportData {
+              reports(
+                guildName: "Fluke",
+                guildServerSlug: "frostmane",
+                guildServerRegion: "US",
+                limit: 1
+              ) {
+                data {
+                  code
+                  title
+                  startTime
+                  endTime
+                  fights(killType: All) {
+                    name
+                    kill
+                    encounterID
+                    startTime
+                    endTime
+                  }
+                }
+              }
+            }
+          }
+        `, accessToken);
+
+        const report = data.data?.reportData?.reports?.data?.[0] ?? null;
+        if (!report) throw new Error("No reports found");
+
+        // Filter to boss fights only (encounterID > 0), deduplicated by name
+        // keeping the kill if one exists, otherwise the last attempt
+        const bossMap = new Map();
+        for (const fight of report.fights) {
+          if (fight.encounterID === 0) continue; // skip trash
+          const existing = bossMap.get(fight.name);
+          if (!existing || fight.kill) {
+            bossMap.set(fight.name, fight);
+          }
         }
-      `;
 
-      const gqlRes = await fetch("https://www.warcraftlogs.com/api/v2/client", {
-        method: "POST",
-        headers: {
-          "Content-Type":  "application/json",
-          "Authorization": `Bearer ${access_token}`,
-        },
-        body: JSON.stringify({ query }),
-      });
-      if (!gqlRes.ok) throw new Error(`WCL GraphQL error: ${gqlRes.statusText}`);
-      const gqlData = await gqlRes.json();
-      // console.log(JSON.stringify(gqlData, null, 2));
+        const bosses = Array.from(bossMap.values());
+        const kills  = bosses.filter(b => b.kill).length;
+        const total  = bosses.length;
 
-      if (gqlData.errors) throw new Error(gqlData.errors[0].message);
+        // Raid duration from first fight start to last fight end
+        const fightTimes = report.fights.filter(f => f.encounterID > 0);
+        const raidStart  = Math.min(...fightTimes.map(f => f.startTime));
+        const raidEnd    = Math.max(...fightTimes.map(f => f.endTime));
+        const durationMs = raidEnd - raidStart;
+        const hours      = Math.floor(durationMs / 3600000);
+        const minutes    = Math.floor((durationMs % 3600000) / 60000);
+        const duration   = `${hours}h ${String(minutes).padStart(2, '0')}m`;
 
-      const zoneRankings = gqlData.data?.guildData?.guild?.zoneRanking ?? {};
+        const date = new Date(report.startTime).toLocaleDateString('en-US', {
+          month: 'long', day: 'numeric'
+        });
 
-      const result = {
-        progress: {
-          world:  zoneRankings.progress?.worldRank  ?? null,
-          region: zoneRankings.progress?.regionRank ?? null,
-          server: zoneRankings.progress?.serverRank ?? null,
-        },
-        speed: {
-          world:  zoneRankings.speed?.worldRank  ?? null,
-          region: zoneRankings.speed?.regionRank ?? null,
-          server: zoneRankings.speed?.serverRank ?? null,
-        },
-      };
+        result = {
+          code:     report.code,
+          title:    report.title,
+          date,
+          duration,
+          kills,
+          total,
+          bosses:   bosses.map(b => ({ name: b.name, kill: b.kill })),
+          url:      `https://www.warcraftlogs.com/reports/${report.code}`,
+        };
 
-      // Create response with CORS headers
+      } else {
+        return new Response(JSON.stringify({ error: "Unknown route. Use /rankings or /lastraid" }), {
+          status: 404,
+          headers: corsHeaders,
+        });
+      }
+
       response = new Response(JSON.stringify(result), { headers: corsHeaders });
-
-      // Cache the response
       response.headers.append("Cache-Control", `public, max-age=${CACHE_TTL}`);
       await cache.put(cacheKey, response.clone());
-
       return response;
+
     } catch (err) {
       return new Response(JSON.stringify({ error: err.message }), {
         status: 500,
