@@ -4,6 +4,30 @@
 
 const CACHE_TTL = 300; // 5 minutes
 
+let cachedToken = null;
+let tokenExpiry = 0;
+
+async function getAccessToken(clientId, clientSecret) {
+  if (cachedToken && Date.now() < tokenExpiry) return cachedToken;
+
+  const res = await fetch("https://www.warcraftlogs.com/oauth/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type:    "client_credentials",
+      client_id:     clientId,
+      client_secret: clientSecret,
+    }),
+  });
+  if (!res.ok) throw new Error(`WCL token error: ${res.statusText}`);
+  const data = await res.json();
+
+  cachedToken = data.access_token;
+  tokenExpiry = Date.now() + (data.expires_in - 60) * 1000; // expire 60s early to be safe
+
+  return cachedToken;
+}
+
 export default {
   async fetch(request, env) {
     // Allowed origins for CORS
@@ -41,17 +65,7 @@ export default {
       if (!clientId || !clientSecret) throw new Error("WCL credentials not found");
 
       // Step 1: fetch OAuth token
-      const tokenRes = await fetch("https://www.warcraftlogs.com/oauth/token", {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams({
-          grant_type:    "client_credentials",
-          client_id:     clientId,
-          client_secret: clientSecret,
-        }),
-      });
-      if (!tokenRes.ok) throw new Error(`WCL token error: ${tokenRes.statusText}`);
-      const { access_token } = await tokenRes.json();
+      const access_token = await getAccessToken(clientId, clientSecret);
 
       // Step 2: query GraphQL
       const query = `
